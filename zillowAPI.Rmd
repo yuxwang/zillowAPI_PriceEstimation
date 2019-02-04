@@ -1,0 +1,206 @@
+---
+title: "Zillow API and House value estimation"
+author: "Yuxi Wang"
+date: "January, 2019"
+output:
+  rmarkdown::html_document:
+    theme: lumen
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+#About this project
+In this project, an approach of estimating the value of a property was conducted by using Zillow API and sample address in Log Angeles, CA. Data were analyzed through both sequential fitting/predicting and parallel fitting/predicting. Result showed there the prediction errors from both methods were roughly the same.
+
+#API-Application Program Interface
+For this project `ZillowR` package and the Zillow API were used. Zillow is a real estate website that allows people to view homes that might be for sale (or aren't) and gives them things like an estimated price for the house. A Zillow API account and account key (zws_id) were obtained through registering on zillow.com.
+```{r package,message=FALSE}
+library("tidyverse")
+library("ZillowR")
+library("XML")
+library("data.table")
+library("randomForest")
+library("parallel")
+library("microbenchmark")
+```
+
+There is a list of addresses for the city of Los Angeles available on data.gov. After reading the file of city list, and modifying, the only column with full address names was saved as `addressLA`.
+```{r readAdress,message=FALSE}
+#read csv file-list of address in LA from web, and get the address list
+   cityListLA<-read_csv(url("https://data.lacity.org/api/views/4ca8-mxuh/rows.csv?accessType=DOWNLOAD"))
+#select address related columns only, and generate a new var of full address
+   addressLA<-unite(cityListLA, "Address",c(HSE_NBR,HSE_DIR_CD,STR_NM,STR_SFX_CD),sep=" ") %>% 
+              select(Address)
+   addressLA
+```
+
+#Pull data from an API and convert that data to an appropriate form
+
+First, a subset of these addresses was taken. Set n=4000 as sample size.
+```{r subset.address}
+set.seed(50)
+n<-4000 #sample size
+#randomly sample address
+sampleAddress<-addressLA[sample(1:nrow(addressLA), size = n),]
+```
+
+Then data from zillow's API with sample address was obtained by creating a user-defined function:
+```{r API.function,eval=FALSE}
+###Integrated function for querying and formating of the data
+##create a function to read zillow API based on Address, Address in n*1 data.frame 
+APIReadOutput<-function(Address){
+  #Step 1 read API data based on Address
+  #Create a function to retrieve data$response for sample address
+  #zillow zws_id is hidden
+  readData<-function(Address){ 
+    GetDeepSearchResults(address = Address,citystatezip = "Los Angeles, CA",
+                         zws_id = "X1-ZWz1gsug2....._7..1.")$response
+  }
+  #apply to all sample address
+  getResponse<-lapply(unlist(Address),readData)
+  #eliminate any records returned NULL for $response, this is API data XMLnode
+  LADatasample<-getResponse[-(which(sapply(getResponse,is.null),arr.ind=TRUE))]
+  
+  #Step 2 get variable values for the variables
+  #write a function to get all values and create a df
+  readValues<-function(x){ #x for every API data XMLnode
+    #prasing XML to the root node "result"
+    a<-xmlToDataFrame(nodes = getNodeSet(x, "//result")) 
+    #prasing XML to the root node "address",still need info of street,zipcode, and city
+    b<-xmlToDataFrame(nodes = getNodeSet(x, "//address")) 
+    #zestimate amount (our response variable) in USD
+    zestimateROOT<-getNodeSet(x, "//zestimate")[[1]] # display root node of "zestimate"
+    zestimate<-xmlValue(xmlChildren(zestimateROOT)[[1]]) # Value of first node amount
+    #region name and type
+    regionROOT<-getNodeSet(x, "//region")[[1]]
+    c("Address"=b[1],"Zipcode"=b[2],"City"=b[3],"useCode"=a[5],"taxAsmtYear"=a[6],"taxAsmtValue"= a[7],
+      "yearBuilt"=a[8],"lotSize"=a[9],"finishedSqFt"=a[10],"Bath"=a[11],"Bed"=a[12],"zestiAmount"=zestimate,
+      "regionName"= xmlGetAttr(regionROOT,name="name"),"regionType"=xmlGetAttr(regionROOT,name="type"))
+  }
+  #provide lapply with a function with tryCatch to allow procession even meets an error
+  lapply_with_error <- function(X,FUN,...){    
+    lapply(X, function(x, ...) tryCatch(FUN(x, ...),
+                                        error=function(e) NULL))}
+  valuesList<-lapply_with_error(LADatasample,readValues) #to retrieve values of required variables
+  xx<-valuesList[-which(sapply(valuesList, is.null),arr.ind=TRUE)] #to eliminate Null element 
+  #since some results don't have all 14 variables generated, function to see if the list element has 14 variables 
+  is.14<-function(list,...){
+    if (length(attributes(list)$names)==14){return(TRUE)}
+    else{return(FALSE)}
+  }
+  #generate conditional index of whether the element has all required 14 variables
+  cond<-sapply(xx,is.14)
+  
+  #Step 3 obtained data list to data frame
+  #convert each element in the list to data frame, but xxx is still a list
+  xxx<-lapply(xx[cond],as.data.frame)
+  #convert list to data frame
+  dfValues<-rbindlist(xxx)
+  #modify the classification of variables, and reset the coloumn names
+  dfValues<-dfValues %>% as.tibble() %>% mutate_at(c(1:3,6:13),as.character)%>%
+    mutate_at(c(6:12),as.numeric) %>% filter(.[7] <= 2018)
+  colnames(dfValues) <-c("Address","Zipcode","City","useCode","taxAsmtYear","taxAsmtValue",
+                         "yearBuilt","lotSize","finishedSqFt","Bath", "Bed", "zestiAmount",
+                         "regionName","regionType")
+  
+  #Step 4 output dataframe with eliminating any NAs in any cell
+  dfValues<-na.omit(dfValues)
+  return(dfValues)
+}
+```
+
+In this function since not all of these addresses worked (either the address doesn't seem to exist or zillow just doesn't have adequate information on specific addresses), so the function includes eliminating results returned NULL several times. 
+
+Then self-defined function was applied to the sample address list to return a data frame, and it was saved to a csv file:
+```{r readSampleAddress, warning=FALSE,eval=FALSE}
+dfZillow<-APIReadOutput(sampleAddress)
+dfZillow
+#write to a csv file
+write_csv(dfZillow,'zillowAPIdata.csv')
+```
+
+#Fit models using parallel computing 
+```{r readcsv,message=FALSE,echo=FALSE}
+dfZillow<-read_csv("zillowAPIdata.csv")%>% mutate_at(c(1:3,6:13),as.character)%>%
+    mutate_at(c(6:12),as.numeric)
+dfZillow %>% print(width = Inf)
+```
+
+A training set with 80% of API data and a test set with 20% were formed.
+```{R dataSplit}
+set.seed(1)
+train <- sample(1:nrow(dfZillow), size = nrow(dfZillow)*0.8)
+test <- dplyr::setdiff(1:nrow(dfZillow), train)
+dfZillowTrain <- dfZillow[train, ]
+dfZillowTest <- dfZillow[test, ]
+```
+
+Since any missing data were eliminated in the reading process, it is ready to be analyzed. Bagged regression trees to predict the Zestimate were fitted and the prediction was made using test data. The variables used for fitting model are: `tax assessment value`, `year built`, `lot size`, `finished square feet`, `number of bathrooms`, and `number of bedrooms`.
+
+First, single bagged regression trees with 2000 bootstrap replicants were fitted. The prediction errors for test data was calculated:
+```{r baggedtree,warning=FALSE}
+bagFit <- randomForest::randomForest(zestiAmount ~ taxAsmtValue+yearBuilt+lotSize+finishedSqFt+ Bath+Bed, data = dfZillowTrain, mtry = 7, ntree = 2000, importance = TRUE)
+bagPred <- predict(bagFit, newdata = dplyr::select(dfZillowTest, useCode,taxAsmtValue,
+                                                     yearBuilt,lotSize,finishedSqFt,Bath,Bed))
+bagRMSE <- sqrt(mean((bagPred-dfZillowTest$zestiAmount)^2))
+```
+
+Second, parallel computing was processed. First a function was defined for parallel computing, and 4 of my computer cores were used to do the parallel fitting and computing:
+```{r parallel.baggedtree}
+#function parallel computing 
+parallel.bagFit<-function(data,i){
+        dfZillowTrain <- data[train, ] #train is already saved outside of function
+        dfZillowTest <- data[test, ]  #test is already saved outside of function
+        bagFit <- randomForest::randomForest(zestiAmount ~ taxAsmtValue+yearBuilt+lotSize+finishedSqFt+ Bath+Bed, 
+                                             data = dfZillowTrain, mtry = 7, ntree = i, importance = TRUE)
+        bagPred <- predict(bagFit, newdata = dplyr::select(dfZillowTest, useCode,taxAsmtValue,
+                                                           yearBuilt,lotSize,finishedSqFt,Bath,Bed))
+        bagRMSE <- sqrt(mean((bagPred-dfZillowTest$zestiAmount)^2))
+        return(bagPred)
+      }
+      
+#number of computer cores
+      detectCores() # mine have 8
+      #set # of cores to use
+      cores<-4
+      cluster<-makeCluster(cores)
+      #export outside variables to the other R processes in the cluster
+      clusterExport(cl=cluster, varlist=c("train", "test"))
+      
+ para.prediction<-parLapply(cluster,X=rep(500,cores),fun = parallel.bagFit, data=dfZillow)
+ #to integrate all four prediction results by averaging them
+ df.prediction<-do.call("cbind", para.prediction)
+ AvgPrediction<-rowMeans(df.prediction)
+ par.bagRMSE <-sqrt(mean((AvgPrediction-dfZillowTest$zestiAmount)^2))
+ 
+ c("sequential.RMSE"=bagRMSE,"parallel.RMSE"=par.bagRMSE)
+```
+
+To compare prediction errors, result showed that the sequential rootMSE is `r bagRMSE`, and the parallel rootMSE is `r par.bagRMSE`. These two are very close.
+
+In the plot, it showed how model fit, with comparing zestiAmount from test data and predicting data. Black is for sequential fit and red is for parallel fit. The reference line in blue is with intercept 0 and slope 1.
+```{r plot}
+x<-as.data.frame(cbind("zestiAmount"=dfZillowTest$zestiAmount,"seq"=bagPred,"par"=AvgPrediction))
+ggplot(x,aes(x=zestiAmount,y=seq))+geom_jitter()+geom_jitter(aes(y=par),col="red2",alpha=0.5)+coord_cartesian(xlim=c(200000,3000000),ylim=c(200000,3000000))+geom_abline(slope = 1,intercept = 0,col="blue3")+ylab("Prediction")
+```
+
+To compare the time it takes to fit/predict sequentially vs in parallel, `microbenchmark` package was used. We can see that the time consumed for parallel computing is of 1/4 to 1/3 of the sequential computing.
+```{r timeConsuming,warning=FALSE,message=FALSE}
+parTime<-microbenchmark({
+        para.prediction<-parLapply(cluster,X=rep(500,cores),fun = parallel.bagFit, data=dfZillow)
+        df.prediction<-do.call("cbind", para.prediction)
+        AvgPrediction<-rowMeans(df.prediction)
+        par.bagRMSE <-sqrt(mean((AvgPrediction-dfZillowTest$zestiAmount)^2))
+      },times=10,unit="s")
+
+straightTime<-microbenchmark({
+       bagFit <- randomForest::randomForest(zestiAmount ~ taxAsmtValue+yearBuilt+lotSize+finishedSqFt+ Bath+Bed, 
+                                            data = dfZillowTrain, mtry = 7, ntree = 2000, importance = TRUE)
+       bagPred <- predict(bagFit, newdata = dplyr::select(dfZillowTest, useCode,taxAsmtValue,
+                                                     yearBuilt,lotSize,finishedSqFt,Bath,Bed))
+       bagRMSE <- sqrt(mean((bagPred-dfZillowTest$zestiAmount)^2))
+      },times=10,unit="s")
+ parTime
+ straightTime
+```
